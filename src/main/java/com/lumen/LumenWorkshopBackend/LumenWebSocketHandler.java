@@ -1,25 +1,53 @@
 package com.lumen.LumenWorkshopBackend;
 
 import java.io.IOException;
-import java.sql.Date;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
-import java.util.HashMap;
 import java.util.Map;
 
+import org.springframework.context.ApplicationContext;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lumen.LumenWorkshopBackend.config.ApplicationContextProvider;
+import com.lumen.LumenWorkshopBackend.config.ConfigurationHelper;
 import com.lumen.LumenWorkshopBackend.service.CassandraService;
+import com.lumen.LumenWorkshopBackend.service.RedisUserChannelService;
+import com.lumen.LumenWorkshopBackend.service.WebSocketSessionService;
 
 public class LumenWebSocketHandler extends TextWebSocketHandler{
 	
-	Map<String, WebSocketSession> userSession = new HashMap<String, WebSocketSession>();
+	
 	ObjectMapper mapper = new ObjectMapper();
 	
 	LumenWebSocketHandler(CassandraService service){
 		this.cassandraService = service;
+	}
+	
+	private WebSocketSessionService getWebSocketSessionService() {
+		ApplicationContext context = 
+	            ApplicationContextProvider.getApplicationContext();
+		return context.getBean(WebSocketSessionService.class);
+	}
+	
+	private RedisUserChannelService getRedisUserChannelService() {
+		ApplicationContext context = 
+	            ApplicationContextProvider.getApplicationContext();
+		return context.getBean(RedisUserChannelService.class);
+	}
+	
+	private RedisTemplate<String,String> getRedisTemplate() {
+		ApplicationContext context = 
+	            ApplicationContextProvider.getApplicationContext();
+		Map<String, RedisTemplate> beans = context.getBeansOfType(RedisTemplate.class);
+        if (beans.size() > 1) {
+            // Choose specific bean or throw custom exception
+            return beans.get("redisTemplate");
+        }
+        return context.getBean(RedisTemplate.class);
 	}
 
 	CassandraService cassandraService;
@@ -29,7 +57,8 @@ public class LumenWebSocketHandler extends TextWebSocketHandler{
 		String connectionURL = session.getUri().getPath();
 		String username = getUsername(connectionURL);
 		cassandraService.insertUser(username);
-		userSession.put(username, session);
+		getRedisUserChannelService().registerUser(username, ConfigurationHelper.getServerName());
+		getWebSocketSessionService().putUserSession(username, session);
 	}
 	
 	private String getUsername(String connectionURL) {
@@ -44,11 +73,8 @@ public class LumenWebSocketHandler extends TextWebSocketHandler{
 			String sender = getUsername(session.getUri().getPath());
 			String to = message.getTo();
 			
-			//If user is not registered for Lumen Chat
-			if(!userSession.containsKey(to)) {
-				throw new Exception("Person not available");
-			}
 			LumenMessage toMessage = new LumenMessage();
+			toMessage.setTo(to);
 			toMessage.setFrom(sender);
 			toMessage.setMessage(message.getMessage());
 			toMessage.setMessageId(message.getMessageId());
@@ -56,7 +82,8 @@ public class LumenWebSocketHandler extends TextWebSocketHandler{
 			
 			cassandraService.addMessage(message.getConversationKey(), message.getMessage(), sender, to, message.getMessageId(), new Timestamp(System.currentTimeMillis()));
 			
-			userSession.get(to).sendMessage(new TextMessage(mapper.writeValueAsString(toMessage)));
+			//userSession.get(to).sendMessage(new TextMessage(mapper.writeValueAsString(toMessage)));
+			sendMessage(to, mapper.writeValueAsString(toMessage));
 			
 			//Send Acknowledgement to sender
 			LumenMessage ackMessage = message;
@@ -76,5 +103,20 @@ public class LumenWebSocketHandler extends TextWebSocketHandler{
 			 Throwable exception) throws IOException {
 		exception.printStackTrace();
 	}
+
+    // Send message to another user
+    public void sendMessage(String receiver, String message) throws Exception {
+        // Look up the channel for the receiver
+        String receiverChannel = getRedisUserChannelService().getUserChannel(receiver);
+        
+        //If user is not registered for Lumen Chat
+		if(receiverChannel==null) {
+			throw new Exception("Person not available");
+		}
+		else {
+            // Publish message to the channel for the receiver
+            getRedisTemplate().convertAndSend(receiverChannel, message.getBytes(StandardCharsets.UTF_8));
+        }
+    }
 
 }
